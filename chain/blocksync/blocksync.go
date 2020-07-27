@@ -106,29 +106,32 @@ func NewBlockSyncService(cs *store.ChainStore) *BlockSyncService {
 	}
 }
 
-func (bss *BlockSyncService) HandleStream(s inet.Stream) {
+// Entry point of the service.
+func (bss *BlockSyncService) HandleStream(stream inet.Stream) {
 	ctx, span := trace.StartSpan(context.Background(), "blocksync.HandleStream")
 	defer span.End()
 
-	defer s.Close() //nolint:errcheck
+	defer stream.Close() //nolint:errcheck
 
 	var req BlockSyncRequest
-	if err := cborutil.ReadCborRPC(bufio.NewReader(s), &req); err != nil {
+	if err := cborutil.ReadCborRPC(bufio.NewReader(stream), &req); err != nil {
 		log.Warnf("failed to read block sync request: %s", err)
 		return
 	}
 	log.Infow("block sync request", "start", req.Start, "len", req.RequestLength)
 
-	resp, err := bss.processRequest(ctx, s.Conn().RemotePeer(), &req)
+	resp, err := bss.processRequest(ctx, stream.Conn().RemotePeer(), &req)
 	if err != nil {
 		log.Warn("failed to process block sync request: ", err)
 		return
 	}
 
+	// FIXME: Extract this constant.
 	writeDeadline := 60 * time.Second
-	_ = s.SetDeadline(time.Now().Add(writeDeadline)) // always use real time for socket/stream deadlines.
-	if err := cborutil.WriteCborRPC(s, resp); err != nil {
-		log.Warnw("failed to write back response for handle stream", "err", err, "peer", s.Conn().RemotePeer())
+	_ = stream.SetDeadline(time.Now().Add(writeDeadline)) // always use real time for socket/stream deadlines.
+	if err := cborutil.WriteCborRPC(stream, resp); err != nil {
+		log.Warnw("failed to write back response for handle stream",
+			"err", err, "peer", stream.Conn().RemotePeer())
 		return
 	}
 }
