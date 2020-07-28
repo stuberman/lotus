@@ -99,12 +99,12 @@ func firstTipsetSelector(req *BlockSyncRequest) ipld.Node {
 
 }
 
-func (bs *BlockSync) executeGsyncSelector(ctx context.Context, p peer.ID, root cid.Cid, sel ipld.Node) error {
+func (client *BlockSync) executeGsyncSelector(ctx context.Context, p peer.ID, root cid.Cid, sel ipld.Node) error {
 	extension := graphsync.ExtensionData{
 		Name: "chainsync",
 		Data: nil,
 	}
-	_, errs := bs.gsync.Request(ctx, p, cidlink.Link{Cid: root}, sel, extension)
+	_, errs := client.gsync.Request(ctx, p, cidlink.Link{Cid: root}, sel, extension)
 
 	for err := range errs {
 		return xerrors.Errorf("failed to complete graphsync request: %w", err)
@@ -113,7 +113,7 @@ func (bs *BlockSync) executeGsyncSelector(ctx context.Context, p peer.ID, root c
 }
 
 // Fallback for interacting with other non-lotus nodes
-func (bs *BlockSync) fetchBlocksGraphSync(ctx context.Context, p peer.ID, req *BlockSyncRequest) (*BlockSyncResponse, error) {
+func (client *BlockSync) fetchBlocksGraphSync(ctx context.Context, p peer.ID, req *BlockSyncRequest) (*BlockSyncResponse, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -121,7 +121,7 @@ func (bs *BlockSync) fetchBlocksGraphSync(ctx context.Context, p peer.ID, req *B
 
 	// Do this because we can only request one root at a time
 	for _, r := range req.Start {
-		if err := bs.executeGsyncSelector(ctx, p, r, immediateTsSelector); err != nil {
+		if err := client.executeGsyncSelector(ctx, p, r, immediateTsSelector); err != nil {
 			return nil, err
 		}
 	}
@@ -133,12 +133,12 @@ func (bs *BlockSync) fetchBlocksGraphSync(ctx context.Context, p peer.ID, req *B
 	sel := selectorForRequest(req)
 
 	// execute the selector forreal
-	if err := bs.executeGsyncSelector(ctx, p, req.Start[0], sel); err != nil {
+	if err := client.executeGsyncSelector(ctx, p, req.Start[0], sel); err != nil {
 		return nil, err
 	}
 
 	// Now pull the data we fetched out of the chainstore (where it should now be persisted)
-	tempcs := store.NewChainStore(bs.bserv.Blockstore(), datastore.NewMapDatastore(), nil)
+	tempcs := store.NewChainStore(client.bserv.Blockstore(), datastore.NewMapDatastore(), nil)
 
 	opts := ParseBSOptions(req.Options)
 	tsk := types.NewTipSetKey(req.Start...)

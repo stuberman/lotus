@@ -5,7 +5,6 @@ import (
 	"context"
 	"time"
 
-	"github.com/libp2p/go-libp2p-core/protocol"
 	"go.opencensus.io/trace"
 	"golang.org/x/xerrors"
 
@@ -15,18 +14,10 @@ import (
 	"github.com/filecoin-project/lotus/chain/types"
 
 	"github.com/ipfs/go-cid"
-	logging "github.com/ipfs/go-log/v2"
 	inet "github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
 )
 
-var log = logging.Logger("blocksync")
-
-type NewStreamFunc func(context.Context, peer.ID, ...protocol.ID) (inet.Stream, error)
-
-const BlockSyncProtocolID = "/fil/sync/blk/0.0.1"
-
-const BlockSyncMaxRequestLength = 800
 
 // BlockSyncService is the component that services BlockSync requests from
 // peers.
@@ -46,58 +37,9 @@ const BlockSyncMaxRequestLength = 800
 // The response will include a status code, an optional message, and the
 // response payload in case of success. The payload is a slice of serialized
 // tipsets.
+// FIXME: Rename to just `Service`.
 type BlockSyncService struct {
 	cs *store.ChainStore
-}
-
-type BlockSyncRequest struct {
-	Start         []cid.Cid
-	RequestLength uint64
-
-	Options uint64
-}
-
-type BSOptions struct {
-	IncludeBlocks   bool
-	IncludeMessages bool
-}
-
-func ParseBSOptions(optfield uint64) *BSOptions {
-	return &BSOptions{
-		IncludeBlocks:   optfield&(BSOptBlocks) != 0,
-		IncludeMessages: optfield&(BSOptMessages) != 0,
-	}
-}
-
-const (
-	BSOptBlocks = 1 << iota
-	BSOptMessages
-)
-
-const (
-	StatusOK            = uint64(0)
-	StatusPartial       = uint64(101)
-	StatusNotFound      = uint64(201)
-	StatusGoAway        = uint64(202)
-	StatusInternalError = uint64(203)
-	StatusBadRequest    = uint64(204)
-)
-
-type BlockSyncResponse struct {
-	Chain []*BSTipSet
-
-	Status  uint64
-	Message string
-}
-
-type BSTipSet struct {
-	Blocks []*types.BlockHeader
-
-	BlsMessages    []*types.Message
-	BlsMsgIncludes [][]uint64
-
-	SecpkMessages    []*types.SignedMessage
-	SecpkMsgIncludes [][]uint64
 }
 
 func NewBlockSyncService(cs *store.ChainStore) *BlockSyncService {
@@ -106,7 +48,7 @@ func NewBlockSyncService(cs *store.ChainStore) *BlockSyncService {
 	}
 }
 
-// Entry point of the service.
+// Entry point of the service, handles `BlockSyncRequest`s.
 func (bss *BlockSyncService) HandleStream(stream inet.Stream) {
 	ctx, span := trace.StartSpan(context.Background(), "blocksync.HandleStream")
 	defer span.End()
@@ -136,7 +78,11 @@ func (bss *BlockSyncService) HandleStream(stream inet.Stream) {
 	}
 }
 
-func (bss *BlockSyncService) processRequest(ctx context.Context, p peer.ID, req *BlockSyncRequest) (*BlockSyncResponse, error) {
+func (bss *BlockSyncService) processRequest(
+	ctx context.Context,
+	peer peer.ID,
+	req *BlockSyncRequest,
+	) (*BlockSyncResponse, error) {
 	_, span := trace.StartSpan(ctx, "blocksync.ProcessRequest")
 	defer span.End()
 
@@ -148,21 +94,26 @@ func (bss *BlockSyncService) processRequest(ctx context.Context, p peer.ID, req 
 		}, nil
 	}
 
+	// FIXME: Collapse span.
 	span.AddAttributes(
 		trace.BoolAttribute("blocks", opts.IncludeBlocks),
 		trace.BoolAttribute("messages", opts.IncludeMessages),
 		trace.Int64Attribute("reqlen", int64(req.RequestLength)),
 	)
 
+	// FIXME: Avoid this after renaming `RequestLength` to something shorter.
 	reqlen := req.RequestLength
+	// FIXME: Consider returning an error here.
 	if reqlen > BlockSyncMaxRequestLength {
-		log.Warnw("limiting blocksync request length", "orig", req.RequestLength, "peer", p)
+		log.Warnw("limiting blocksync request length",
+			"orig", req.RequestLength, "peer", peer)
 		reqlen = BlockSyncMaxRequestLength
 	}
 
-	chain, err := collectChainSegment(bss.cs, types.NewTipSetKey(req.Start...), reqlen, opts)
+	chain, err := collectChainSegment(bss.cs, types.NewTipSetKey(req.Start...),
+		reqlen, opts)
 	if err != nil {
-		log.Warn("encountered error while responding to block sync request: ", err)
+		log.Warn("block sync request: collectChainSegment failed: ", err)
 		return &BlockSyncResponse{
 			Status:  StatusInternalError,
 			Message: err.Error(),
@@ -180,8 +131,19 @@ func (bss *BlockSyncService) processRequest(ctx context.Context, p peer.ID, req 
 	}, nil
 }
 
-func collectChainSegment(cs *store.ChainStore, start types.TipSetKey, length uint64, opts *BSOptions) ([]*BSTipSet, error) {
+func collectChainSegment(
+	cs *store.ChainStore,
+	// FIXME: Probably pass the entire request (once validated) instead
+	//  of copying all of its attributes here, this is a private function
+	//  of the blocksync anyway.
+	start types.TipSetKey,
+	// FIXME: This should have the same name as the request attribute.
+	length uint64,
+	opts *BSOptions,
+	) ([]*BSTipSet, error) {
 	var bstips []*BSTipSet
+	// `TipSetKey` pointing to the tipset we already have and will scan
+	//  its parents to continue the search backwards.
 	cur := start
 	for {
 		var bst BSTipSet
@@ -196,6 +158,7 @@ func collectChainSegment(cs *store.ChainStore, start types.TipSetKey, length uin
 				return nil, xerrors.Errorf("gather messages failed: %w", err)
 			}
 
+			// FIXME: Pass the response to the function and set all this there.
 			bst.BlsMessages = bmsgs
 			bst.BlsMsgIncludes = bmincl
 			bst.SecpkMessages = smsgs
@@ -208,6 +171,8 @@ func collectChainSegment(cs *store.ChainStore, start types.TipSetKey, length uin
 
 		bstips = append(bstips, &bst)
 
+		// If we collected the length requested or if we reached the
+		// start (genesis), then stop.
 		if uint64(len(bstips)) >= length || ts.Height() == 0 {
 			return bstips, nil
 		}
@@ -216,6 +181,7 @@ func collectChainSegment(cs *store.ChainStore, start types.TipSetKey, length uin
 	}
 }
 
+// FIXME: DRY. Use messages interface.
 func gatherMessages(cs *store.ChainStore, ts *types.TipSet) ([]*types.Message, [][]uint64, []*types.SignedMessage, [][]uint64, error) {
 	blsmsgmap := make(map[cid.Cid]uint64)
 	secpkmsgmap := make(map[cid.Cid]uint64)
@@ -223,12 +189,13 @@ func gatherMessages(cs *store.ChainStore, ts *types.TipSet) ([]*types.Message, [
 	var blsmsgs []*types.Message
 	var secpkincl, blsincl [][]uint64
 
-	for _, b := range ts.Blocks() {
-		bmsgs, smsgs, err := cs.MessagesForBlock(b)
+	for _, block := range ts.Blocks() {
+		bmsgs, smsgs, err := cs.MessagesForBlock(block)
 		if err != nil {
 			return nil, nil, nil, nil, err
 		}
 
+		// FIXME: What is going on here? Why do we keep track of this?
 		bmi := make([]uint64, 0, len(bmsgs))
 		for _, m := range bmsgs {
 			i, ok := blsmsgmap[m.Cid()]
