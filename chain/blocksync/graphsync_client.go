@@ -11,7 +11,6 @@ import (
 	"golang.org/x/xerrors"
 
 	store "github.com/filecoin-project/lotus/chain/store"
-	"github.com/filecoin-project/lotus/chain/types"
 
 	cidlink "github.com/ipld/go-ipld-prime/linking/cid"
 	basicnode "github.com/ipld/go-ipld-prime/node/basic"
@@ -140,9 +139,12 @@ func (client *BlockSync) fetchBlocksGraphSync(ctx context.Context, p peer.ID, re
 	// Now pull the data we fetched out of the chainstore (where it should now be persisted)
 	tempcs := store.NewChainStore(client.bserv.Blockstore(), datastore.NewMapDatastore(), nil)
 
-	opts := ParseBSOptions(req.Options)
-	tsk := types.NewTipSetKey(req.Start...)
-	chain, err := collectChainSegment(tempcs, tsk, req.RequestLength, opts)
+	validReq, errResponse := validateRequest(ctx, req)
+	if errResponse != nil {
+		return errResponse, nil
+	}
+
+	chain, err := collectChainSegment(tempcs, validReq)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to load chain data from chainstore after successful graphsync response (start = %v): %w", req.Start, err)
 	}

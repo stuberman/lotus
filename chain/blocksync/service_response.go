@@ -15,7 +15,6 @@ import (
 
 	"github.com/ipfs/go-cid"
 	inet "github.com/libp2p/go-libp2p-core/network"
-	"github.com/libp2p/go-libp2p-core/peer"
 )
 
 
@@ -60,9 +59,10 @@ func (bss *BlockSyncService) HandleStream(stream inet.Stream) {
 		log.Warnf("failed to read block sync request: %s", err)
 		return
 	}
-	log.Infow("block sync request", "start", req.Start, "len", req.RequestLength)
+	log.Infow("block sync request",
+		"start", req.Start, "len", req.RequestLength)
 
-	resp, err := bss.processRequest(ctx, stream.Conn().RemotePeer(), &req)
+	resp, err := bss.processRequest(ctx, &req)
 	if err != nil {
 		log.Warn("failed to process block sync request: ", err)
 		return
@@ -78,40 +78,84 @@ func (bss *BlockSyncService) HandleStream(stream inet.Stream) {
 	}
 }
 
+// `BlockSyncRequest` processed and validated to query the tipsets needed.
+type validatedRequest struct {
+	startTipset         types.TipSetKey
+	count uint64
+	options *BSOptions
+}
+
+// Validate and service the request. We return either a protocol
+// response or an internal error. The protocol response may signal
+// a protocol error itself (e.g., invalid request).
 func (bss *BlockSyncService) processRequest(
 	ctx context.Context,
-	peer peer.ID,
 	req *BlockSyncRequest,
-	) (*BlockSyncResponse, error) {
-	_, span := trace.StartSpan(ctx, "blocksync.ProcessRequest")
+) (*BlockSyncResponse, error) {
+	validReq, errResponse := validateRequest(ctx, req)
+	if errResponse != nil {
+		// The request did not pass validation, return the response
+		//  indicating it.
+		return errResponse, nil
+	}
+
+	return bss.serviceRequest(ctx, validReq)
+}
+
+// Validate request and process it as:
+// * parsed options.
+// * limited count.
+// * `TipSetKey` generated from CIDs.
+// FIXME: Document in more length the validations.
+// We either return a `validatedRequest` or a `BlockSyncResponse`
+//  indicating the error why we can't process it. It does not have
+//  any internal errors, it just signals protocol ones.
+func validateRequest(
+	ctx context.Context,
+	req *BlockSyncRequest,
+) (*validatedRequest, *BlockSyncResponse) {
+	_, span := trace.StartSpan(ctx, "blocksync.ValidateRequest")
 	defer span.End()
 
-	opts := ParseBSOptions(req.Options)
+	validReq := validatedRequest{}
+
+	validReq.options = ParseBSOptions(req.Options)
+
+	// FIXME: Consider returning StatusBadRequest here.
+	validReq.count = req.RequestLength
+	if validReq.count > BlockSyncMaxRequestLength {
+		log.Warnw("limiting blocksync request length",
+			"orig", req.RequestLength)
+		validReq.count = BlockSyncMaxRequestLength
+	}
+
 	if len(req.Start) == 0 {
-		return &BlockSyncResponse{
+		return nil, &BlockSyncResponse{
 			Status:  StatusBadRequest,
 			Message: "no cids given in blocksync request",
-		}, nil
+		}
 	}
+	validReq.startTipset = types.NewTipSetKey(req.Start...)
 
-	// FIXME: Collapse span.
+	// FIXME: Add it to the defer at the start.
 	span.AddAttributes(
-		trace.BoolAttribute("blocks", opts.IncludeBlocks),
-		trace.BoolAttribute("messages", opts.IncludeMessages),
-		trace.Int64Attribute("reqlen", int64(req.RequestLength)),
+		trace.BoolAttribute("blocks", validReq.options.IncludeBlocks),
+		trace.BoolAttribute("messages", validReq.options.IncludeMessages),
+		trace.Int64Attribute("reqlen", int64(validReq.count)),
 	)
 
-	// FIXME: Avoid this after renaming `RequestLength` to something shorter.
-	reqlen := req.RequestLength
-	// FIXME: Consider returning an error here.
-	if reqlen > BlockSyncMaxRequestLength {
-		log.Warnw("limiting blocksync request length",
-			"orig", req.RequestLength, "peer", peer)
-		reqlen = BlockSyncMaxRequestLength
-	}
+	return &validReq, nil
+}
 
-	chain, err := collectChainSegment(bss.cs, types.NewTipSetKey(req.Start...),
-		reqlen, opts)
+func (bss *BlockSyncService) serviceRequest(
+	ctx context.Context,
+	req *validatedRequest,
+	) (*BlockSyncResponse, error) {
+	_, span := trace.StartSpan(ctx, "blocksync.ServiceRequest")
+	defer span.End()
+
+	// FIXME: Maybe just collapse with `collectChainSegment` here.
+	chain, err := collectChainSegment(bss.cs, req)
 	if err != nil {
 		log.Warn("block sync request: collectChainSegment failed: ", err)
 		return &BlockSyncResponse{
@@ -121,7 +165,7 @@ func (bss *BlockSyncService) processRequest(
 	}
 
 	status := StatusOK
-	if reqlen < req.RequestLength {
+	if len(chain) < int(req.count) {
 		status = StatusPartial
 	}
 
@@ -133,18 +177,12 @@ func (bss *BlockSyncService) processRequest(
 
 func collectChainSegment(
 	cs *store.ChainStore,
-	// FIXME: Probably pass the entire request (once validated) instead
-	//  of copying all of its attributes here, this is a private function
-	//  of the blocksync anyway.
-	start types.TipSetKey,
-	// FIXME: This should have the same name as the request attribute.
-	length uint64,
-	opts *BSOptions,
+	req *validatedRequest,
 	) ([]*BSTipSet, error) {
 	var bstips []*BSTipSet
 	// `TipSetKey` pointing to the tipset we already have and will scan
 	//  its parents to continue the search backwards.
-	cur := start
+	cur := req.startTipset
 	for {
 		var bst BSTipSet
 		ts, err := cs.LoadTipSet(cur)
@@ -152,7 +190,7 @@ func collectChainSegment(
 			return nil, xerrors.Errorf("failed loading tipset %s: %w", cur, err)
 		}
 
-		if opts.IncludeMessages {
+		if req.options.IncludeMessages {
 			bmsgs, bmincl, smsgs, smincl, err := gatherMessages(cs, ts)
 			if err != nil {
 				return nil, xerrors.Errorf("gather messages failed: %w", err)
@@ -165,7 +203,7 @@ func collectChainSegment(
 			bst.SecpkMsgIncludes = smincl
 		}
 
-		if opts.IncludeBlocks {
+		if req.options.IncludeBlocks {
 			bst.Blocks = ts.Blocks()
 		}
 
@@ -173,7 +211,7 @@ func collectChainSegment(
 
 		// If we collected the length requested or if we reached the
 		// start (genesis), then stop.
-		if uint64(len(bstips)) >= length || ts.Height() == 0 {
+		if uint64(len(bstips)) >= req.count || ts.Height() == 0 {
 			return bstips, nil
 		}
 
