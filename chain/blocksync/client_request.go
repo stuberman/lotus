@@ -7,7 +7,6 @@ import (
 	"math/rand"
 	"time"
 
-	blocks "github.com/ipfs/go-block-format"
 	bserv "github.com/ipfs/go-blockservice"
 	"github.com/ipfs/go-cid"
 	graphsync "github.com/ipfs/go-graphsync"
@@ -48,6 +47,7 @@ type BlockSync struct {
 }
 
 func NewBlockSyncClient(
+	// FIXME: REMOVE THIS.
 	bserv dtypes.ChainBlockService,
 	h host.Host,
 	pmgr peermgr.MaybePeerMgr,
@@ -385,6 +385,8 @@ func (client *BlockSync) fetchBlocksBlockSync(
 }
 
 // FIXME: Check request.
+// FIXME: Rename to just `processResponse`. Similar to the service model,
+//  validate and service (or equivalent, in this case maybe store response).
 func (client *BlockSync) processBlocksResponse(
 	req *BlockSyncRequest,
 	res *BlockSyncResponse,
@@ -441,99 +443,4 @@ func (client *BlockSync) RemovePeer(p peer.ID) {
 // FIXME: Merge with the shuffle if we *always* do it.
 func (client *BlockSync) getPeers() []peer.ID {
 	return client.peerTracker.prefSortedPeers()
-}
-
-func (client *BlockSync) FetchMessagesByCids(ctx context.Context, cids []cid.Cid) ([]*types.Message, error) {
-	out := make([]*types.Message, len(cids))
-
-	err := client.fetchCids(ctx, cids, func(i int, b blocks.Block) error {
-		msg, err := types.DecodeMessage(b.RawData())
-		if err != nil {
-			return err
-		}
-
-		// FIXME: We already sort in `fetchCids`, we are duplicating too much work,
-		//  we don't need to pass the index.
-		if out[i] != nil {
-			return fmt.Errorf("received duplicate message")
-		}
-
-		out[i] = msg
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-// FIXME: Duplicate of above.
-func (client *BlockSync) FetchSignedMessagesByCids(ctx context.Context, cids []cid.Cid) ([]*types.SignedMessage, error) {
-	out := make([]*types.SignedMessage, len(cids))
-
-	err := client.fetchCids(ctx, cids, func(i int, b blocks.Block) error {
-		smsg, err := types.DecodeSignedMessage(b.RawData())
-		if err != nil {
-			return err
-		}
-
-		if out[i] != nil {
-			return fmt.Errorf("received duplicate message")
-		}
-
-		out[i] = smsg
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-// Fetch `cids` from the block service, apply `cb` on each of them. Used
-//  by the fetch message functions above.
-// We check that each block is received only once and we do not received
-//  blocks we did not request.
-// FIXME: We should probably extract this logic to the `BlockService` and
-//  make it public.
-func (client *BlockSync) fetchCids(
-	ctx context.Context,
-	cids []cid.Cid,
-	cb func(int, blocks.Block) error,
-) error {
-	// FIXME: Why don't we use the context here?
-	fetchedBlocks := client.bserv.GetBlocks(context.TODO(), cids)
-
-	cidIndex := make(map[cid.Cid]int)
-	for i, c := range cids {
-		cidIndex[c] = i
-	}
-
-	for i := 0; i < len(cids); i++ {
-		select {
-		case block, ok := <-fetchedBlocks:
-			if !ok {
-				// Closed channel, no more blocks fetched, check if we have all
-				// of the CIDs requested.
-				// FIXME: Review this check. We don't call the callback on the
-				//  last index?
-				if i == len(cids)-1 {
-					break
-				}
-
-				return fmt.Errorf("failed to fetch all messages")
-			}
-
-			ix, ok := cidIndex[block.Cid()]
-			if !ok {
-				return fmt.Errorf("received message we didnt ask for")
-			}
-
-			if err := cb(ix, block); err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
 }
