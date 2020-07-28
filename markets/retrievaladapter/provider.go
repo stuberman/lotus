@@ -2,15 +2,17 @@ package retrievaladapter
 
 import (
 	"context"
-	"github.com/filecoin-project/sector-storage/storiface"
+	"fmt"
 	"io"
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-fil-markets/retrievalmarket"
 	"github.com/filecoin-project/go-fil-markets/shared"
 	sectorstorage "github.com/filecoin-project/sector-storage"
+	"github.com/filecoin-project/sector-storage/storiface"
 	"github.com/filecoin-project/specs-actors/actors/abi"
 	"github.com/filecoin-project/specs-actors/actors/builtin/paych"
+	"github.com/ipfs/go-cid"
 
 	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/chain/types"
@@ -39,7 +41,8 @@ func (rpn *retrievalProviderNode) GetMinerWorkerAddress(ctx context.Context, min
 	return mi.Worker, err
 }
 
-func (rpn *retrievalProviderNode) UnsealSector(ctx context.Context, sectorID uint64, offset uint64, length uint64) (io.ReadCloser, error) {
+func (rpn *retrievalProviderNode) UnsealSector(ctx context.Context, sectorID abi.SectorNumber, offset abi.UnpaddedPieceSize, length abi.UnpaddedPieceSize) (io.ReadCloser, error) {
+	fmt.Println("Unsealing Sector: ", sectorID, offset, length)
 	si, err := rpn.miner.GetSectorInfo(abi.SectorNumber(sectorID))
 	if err != nil {
 		return nil, err
@@ -57,7 +60,15 @@ func (rpn *retrievalProviderNode) UnsealSector(ctx context.Context, sectorID uin
 
 	r, w := io.Pipe()
 	go func() {
-		err := rpn.sealer.ReadPiece(ctx, w, sid, storiface.UnpaddedByteIndex(offset), abi.UnpaddedPieceSize(length), si.TicketValue, *si.CommD)
+		var commd cid.Cid
+		if si.CommD != nil {
+			commd = *si.CommD
+		}
+		fmt.Println("read piece...")
+		err := rpn.sealer.ReadPiece(ctx, w, sid, storiface.UnpaddedByteIndex(offset), length, si.TicketValue, commd) // do we really need to pass a commD here?
+		if err != nil {
+			fmt.Println("read piece errored: ", err)
+		}
 		_ = w.CloseWithError(err)
 	}()
 
