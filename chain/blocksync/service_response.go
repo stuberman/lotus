@@ -36,7 +36,7 @@ import (
 // The response will include a status code, an optional message, and the
 // response payload in case of success. The payload is a slice of serialized
 // tipsets.
-// FIXME: Rename to just `Service`.
+// FIXME: Rename to just `Server`.
 type BlockSyncService struct {
 	cs *store.ChainStore
 }

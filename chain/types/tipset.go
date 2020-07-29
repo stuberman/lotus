@@ -224,3 +224,7 @@ func (ts *TipSet) Contains(oc cid.Cid) bool {
 	}
 	return false
 }
+
+func (ts *TipSet) IsParentOf(child *TipSet) bool {
+	return CidArrsEqual(child.Parents().Cids(), ts.Cids())
+}

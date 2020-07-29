@@ -24,6 +24,8 @@ const BlockSyncMaxRequestLength = 800
 
 type BlockSyncRequest struct {
 	// List of CIDs comprising a `TipSetKey` from where to start fetching.
+	// FIXME: Why don't we send a `TipSetKey` instead of converting back
+	//  and forth?
 	Start         []cid.Cid
 	// Number of block sets to fetch from `Start`.
 	// FIXME: Including start?
@@ -48,6 +50,9 @@ func ParseBSOptions(optfield uint64) *BSOptions {
 
 // FIXME: Type these.
 const (
+	// FIXME: This seems like it should be implicit in the protocol,
+	// is there a case we don't want the blocks? The messages are
+	//  not (cannot) be transported alone.
 	BSOptBlocks = 1 << iota
 	BSOptMessages
 )
