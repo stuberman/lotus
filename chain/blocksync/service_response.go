@@ -119,7 +119,7 @@ func validateRequest(
 
 	validReq := validatedRequest{}
 
-	validReq.options = ParseBSOptions(req.Options)
+	validReq.options = parseOptions(req.Options)
 
 	// FIXME: Consider returning StatusBadRequest here.
 	validReq.count = req.RequestLength
@@ -131,8 +131,8 @@ func validateRequest(
 
 	if len(req.Start) == 0 {
 		return nil, &BlockSyncResponse{
-			Status:  StatusBadRequest,
-			Message: "no cids given in blocksync request",
+			Status:       StatusBadRequest,
+			ErrorMessage: "no cids given in blocksync request",
 		}
 	}
 	validReq.startTipset = types.NewTipSetKey(req.Start...)
@@ -159,8 +159,8 @@ func (bss *BlockSyncService) serviceRequest(
 	if err != nil {
 		log.Warn("block sync request: collectChainSegment failed: ", err)
 		return &BlockSyncResponse{
-			Status:  StatusInternalError,
-			Message: err.Error(),
+			Status:       StatusInternalError,
+			ErrorMessage: err.Error(),
 		}, nil
 	}
 
@@ -197,10 +197,10 @@ func collectChainSegment(
 			}
 
 			// FIXME: Pass the response to the function and set all this there.
-			bst.BlsMessages = bmsgs
-			bst.BlsMsgIncludes = bmincl
-			bst.SecpkMessages = smsgs
-			bst.SecpkMsgIncludes = smincl
+			bst.Messages.Bls = bmsgs
+			bst.Messages.BlsIncludes = bmincl
+			bst.Messages.Secpk = smsgs
+			bst.Messages.SecpkIncludes = smincl
 		}
 
 		if req.options.IncludeBlocks {
@@ -262,23 +262,4 @@ func gatherMessages(cs *store.ChainStore, ts *types.TipSet) ([]*types.Message, [
 	}
 
 	return blsmsgs, blsincl, secpkmsgs, secpkincl, nil
-}
-
-func bstsToFullTipSet(bts *BSTipSet) (*store.FullTipSet, error) {
-	fts := &store.FullTipSet{}
-	for i, b := range bts.Blocks {
-		fb := &types.FullBlock{
-			Header: b,
-		}
-		for _, mi := range bts.BlsMsgIncludes[i] {
-			fb.BlsMessages = append(fb.BlsMessages, bts.BlsMessages[mi])
-		}
-		for _, mi := range bts.SecpkMsgIncludes[i] {
-			fb.SecpkMessages = append(fb.SecpkMessages, bts.SecpkMessages[mi])
-		}
-
-		fts.Blocks = append(fts.Blocks, fb)
-	}
-
-	return fts, nil
 }

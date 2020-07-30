@@ -8,9 +8,7 @@ import (
 	"time"
 
 	bserv "github.com/ipfs/go-blockservice"
-	"github.com/ipfs/go-cid"
 	graphsync "github.com/ipfs/go-graphsync"
-	gsnet "github.com/ipfs/go-graphsync/network"
 	host "github.com/libp2p/go-libp2p-core/host"
 	inet "github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
@@ -24,13 +22,6 @@ import (
 	incrt "github.com/filecoin-project/lotus/lib/increadtimeout"
 	"github.com/filecoin-project/lotus/lib/peermgr"
 	"github.com/filecoin-project/lotus/node/modules/dtypes"
-
-	basicnode "github.com/ipld/go-ipld-prime/node/basic"
-	ipldselector "github.com/ipld/go-ipld-prime/traversal/selector"
-	"github.com/ipfs/go-datastore"
-	"github.com/ipld/go-ipld-prime"
-	cidlink "github.com/ipld/go-ipld-prime/linking/cid"
-	selectorbuilder "github.com/ipld/go-ipld-prime/traversal/selector/builder"
 )
 
 // Block synchronization client.
@@ -61,35 +52,156 @@ func NewBlockSyncClient(
 	gs dtypes.Graphsync,
 ) *BlockSync {
 	return &BlockSync{
+		// FIXME: REMOVE.
 		bserv:       bserv,
 		host:        h,
 		peerTracker: newPeerTracker(pmgr.Mgr),
+		// FIXME: REMOVE.
 		peerMgr:     pmgr.Mgr,
 		gsync:       gs,
 	}
 }
 
-// Convert status to internal error.
-// FIXME: Check request.
-// FIXME: This error strings are repeated elsewhere.
-// FIXME: Should be in the common file.
-func statusToError(res *BlockSyncResponse) error {
-	switch res.Status {
-	case StatusOK, StatusPartial:
-		// FIXME: Consider if we want to not process `StatusPartial`
-		//  and return an error.
-		return nil
-	case StatusNotFound:
-		return xerrors.Errorf("not found")
-	case StatusGoAway:
-		return xerrors.Errorf("not handling 'go away' blocksync responses yet")
-	case StatusInternalError:
-		return xerrors.Errorf("block sync peer errored: %s", res.Message)
-	case StatusBadRequest:
-		return xerrors.Errorf("block sync request invalid: %s", res.Message)
-	default:
-		return xerrors.Errorf("unrecognized response code: %d", res.Status)
+// Internal single point of entry to the client request processing
+// servicing the external-facing API. Currently we have 3 very
+// heterogeneous services exposed:
+// * GetBlocks:         BSOptBlocks
+// * GetFullTipSet:     BSOptBlocks | BSOptMessages
+// * GetChainMessages:                BSOptMessages
+// This function handles all the different combinations of the available
+// request options without disrupting external calls. In the future the
+// consumers should be forced to use a more standardized service and
+// adhere to a single API derived from this function.
+func (client *BlockSync) doRequest(
+	ctx context.Context,
+	req *BlockSyncRequest,
+	// FIXME: Document.
+	singlePeer *peer.ID,
+) (*ValidatedResponse, error) {
+	var peers []peer.ID
+	if singlePeer != nil {
+		peers = []peer.ID{*singlePeer}
+	} else {
+		peers := client.getShuffledPeers()
+		if len(peers) == 0 {
+			return nil, xerrors.Errorf("GetBlocks failed: no peers available")
+		}
 	}
+
+	// Try for each peer available, return on the first successful response.
+	startTime := build.Clock.Now() // FIXME: Should we track time per peer instead?
+	for _, peer := range peers {
+		// FIXME: doing this synchronously isn't great, but fetching in parallel
+		//  may not be a good idea either. Think about this more.
+		select {
+		case <-ctx.Done():
+			return nil, xerrors.Errorf("doRequest failed: %w", ctx.Err())
+		default:
+		}
+
+		// Send request, read response.
+		res, err := client.sendRequestToPeer(ctx, peer, req)
+		if err != nil {
+			if !xerrors.Is(err, inet.ErrNoConn) {
+				log.Warnf("doRequest failed for peer %s: %s",
+					peer.String(), err)
+			}
+			continue
+		}
+
+		// Parse response answer.
+
+		// Verify blocks.
+		// FIXME: Is there something we can verify from the messages?
+
+		// Process: extract blocks into the tipset, return that, which
+		// can be consumed directly by GetBlocks.
+
+
+		validRes, err := client.processResponse(req, res)
+		if err != nil {
+			log.Warnf("peer %s response failed: %s",
+				peer.String(), err)
+			continue
+		}
+
+		client.peerTracker.logGlobalSuccess(build.Clock.Since(startTime))
+		// FIXME: Extract constant.
+		client.host.ConnManager().TagPeer(peer, "bsync", 25)
+		return validRes, nil
+
+	}
+
+	// FIXME: REport a separte failed for single peer error.
+	return nil, xerrors.Errorf("GetBlocks failed with all peers")
+}
+
+// process: Validate and extract.
+// Extract the chain from the response, creating one tipset at a time
+// and verifying each is connected to the next (its parent).
+// We are conflating status and validation errors here for simplicity in
+//  the code. // FIXME: Review this.
+// FIXME: We should penalize here (before returning) the peer. This should
+//  have a separate validation function maybe.
+// FIXME: Check request parent (that start matches first). Check connections.
+func (client *BlockSync) processResponse(
+	req *BlockSyncRequest,
+	res *BlockSyncResponse,
+) (validRes *ValidatedResponse, err error) {
+	err = res.statusToError()
+	if err != nil {
+		return nil, xerrors.Errorf("status error: %s", err)
+	}
+
+	if len(res.Chain) == 0 {
+		// FIXME: We assume here then that count > 1. That should be in the
+		//  protocol.
+		return nil, xerrors.Errorf("got no blocks in successful response")
+	}
+	if len(res.Chain) > int(req.RequestLength) {
+		return nil, xerrors.Errorf("got longer response (%d) than requested (%d)",
+			len(res.Chain), req.RequestLength)
+	}
+
+	options := parseOptions(req.Options)
+
+	if options.IncludeBlocks {
+		validRes.Tipsets = make([]*types.TipSet, req.RequestLength)
+		// FIXME: Just do a single for to extract into tipsets, then
+		//  another to check parents that ignores the first index (starts at 1).
+		//  Avoid this head/parent and append artifacts.
+		head, err := types.NewTipSet(res.Chain[0].Blocks)
+		if err != nil {
+			return nil, err
+		}
+		validRes.Tipsets[0] = head
+		for i := 1; i < len(res.Chain); i++ {
+			parent, err := types.NewTipSet(res.Chain[i].Blocks)
+			if err != nil {
+				return nil, err
+			}
+
+			if parent.IsParentOf(head) == false {
+				return nil, fmt.Errorf("tipsets [%d-%d] are not connected",
+					i-1, i)
+				// FIXME: Give more information here, maybe CIDs.
+			}
+
+			validRes.Tipsets[i] = parent
+			head = parent
+		}
+	}
+
+	if options.IncludeMessages {
+		validRes.Messages = make([]*CompactedMessages, req.RequestLength)
+		for i, tipset := range res.Chain {
+			validRes.Messages[i] = tipset.Messages
+		}
+		// FIXME: Any check we can do here? Does it depends on having blocks?
+		//  IF the blocks are present check that they match indexes for toFullTipSets.
+	}
+
+	return validRes, nil
 }
 
 // GetBlocks fetches count blocks from the network, from the provided tipset
@@ -97,7 +209,6 @@ func statusToError(res *BlockSyncResponse) error {
 //
 // {hint/usage}: This is used by the Syncer during normal chain syncing and when
 // resolving forks.
-// FIXME: Make the request options an argument.
 func (client *BlockSync) GetBlocks(
 	ctx context.Context,
 	tsk types.TipSetKey,
@@ -118,50 +229,19 @@ func (client *BlockSync) GetBlocks(
 		Options:       BSOptBlocks,
 	}
 
-	peers := client.getShuffledPeers()
-	if len(peers) == 0 {
-		return nil, xerrors.Errorf("GetBlocks failed: no peers available")
+	validRes, err := client.doRequest(ctx, req, nil)
+	if err != nil {
+		return nil, err
 	}
 
-	startTime := build.Clock.Now()
-	for _, peer := range peers {
-		// FIXME: doing this synchronously isn't great, but fetching in parallel
-		//  may not be a good idea either. Think about this more.
-		select {
-		case <-ctx.Done():
-			return nil, xerrors.Errorf("GetBlocks failed: %w", ctx.Err())
-		default:
-		}
-
-		res, err := client.sendRequestToPeer(ctx, peer, req)
-		if err != nil {
-			if !xerrors.Is(err, inet.ErrNoConn) {
-				log.Warnf("BlockSync request failed for peer %s: %s",
-					peer.String(), err)
-			}
-			continue
-		}
-
-		respTipsets, err := client.processResponse(req, res)
-		if err != nil {
-			log.Warnf("peer %s response failed: %s",
-				peer.String(), err)
-			continue
-		}
-
-		client.peerTracker.logGlobalSuccess(build.Clock.Since(startTime))
-		// FIXME: Extract constant.
-		client.host.ConnManager().TagPeer(peer, "bsync", 25)
-		return respTipsets, nil
-
-	}
-
-	return nil, xerrors.Errorf("GetBlocks failed with all peers")
+	return validRes.Tipsets, nil
 }
 
-// FIXME: Reuse from `GetBlocks` once that function is reviewed.
-// FIXME: We target a single peer here, this is another variation.
-func (client *BlockSync) GetFullTipSet(ctx context.Context, p peer.ID, tsk types.TipSetKey) (*store.FullTipSet, error) {
+func (client *BlockSync) GetFullTipSet(
+	ctx context.Context,
+	peer peer.ID,
+	tsk types.TipSetKey,
+) (*store.FullTipSet, error) {
 	// TODO: round robin through these peers on error
 
 	req := &BlockSyncRequest{
@@ -170,93 +250,42 @@ func (client *BlockSync) GetFullTipSet(ctx context.Context, p peer.ID, tsk types
 		Options:       BSOptBlocks | BSOptMessages,
 	}
 
-	res, err := client.sendRequestToPeer(ctx, p, req)
+	validRes, err := client.doRequest(ctx, req, &peer)
 	if err != nil {
 		return nil, err
 	}
 
-	// FIXME: USE CONSTANTS!
-	switch res.Status {
-	case 0: // Success
-		if len(res.Chain) == 0 {
-			return nil, fmt.Errorf("got zero length chain response")
-		}
-		bts := res.Chain[0]
-
-		return bstsToFullTipSet(bts)
-	case 101: // Partial Response
-		return nil, xerrors.Errorf("partial responses are not handled for single tipset fetching")
-	case 201: // req.Start not found
-		return nil, fmt.Errorf("not found")
-	case 202: // Go Away
-		return nil, xerrors.Errorf("received 'go away' response peer")
-	case 203: // Internal Error
-		return nil, fmt.Errorf("block sync peer errored: %q", res.Message)
-	case 204: // Invalid Request
-		return nil, fmt.Errorf("block sync request invalid: %q", res.Message)
-	default:
-		return nil, fmt.Errorf("unrecognized response code")
-	}
+	return validRes.toFullTipSets()[0], nil
+	// If `doRequest` didn't fail we are guaranteed to have at least
+	//  *one* tipset here, so it's safe to index directly.
 }
 
-// FIXME: Reuse from `GetBlocks` once that function is reviewed.
-//  What is exactly the difference between the two? Just `BSOptMessages`
-//  versus `BSOptBlocks`?
 func (client *BlockSync) GetChainMessages(
 	ctx context.Context,
 	// FIXME: Standard naming.
 	h *types.TipSet,
 	count uint64,
-	) ([]*BSTipSet, error) {
+	) ([]*CompactedMessages, error) {
 	ctx, span := trace.StartSpan(ctx, "GetChainMessages")
 	defer span.End()
 
-	peers := client.getShuffledPeers()
-
-	// FIXME: Same from GetBlocks.
 	req := &BlockSyncRequest{
 		Start:         h.Cids(),
 		RequestLength: count,
 		Options:       BSOptMessages,
 	}
 
-	var err error
-	start := build.Clock.Now()
-
-	for _, p := range peers {
-		res, rerr := client.sendRequestToPeer(ctx, p, req)
-		if rerr != nil {
-			err = rerr
-			log.Warnf("BlockSync request failed for peer %s: %s", p.String(), err)
-			continue
-		}
-
-		if res.Status == StatusOK {
-			client.peerTracker.logGlobalSuccess(build.Clock.Since(start))
-			return res.Chain, nil
-		}
-
-		if res.Status == StatusPartial {
-			// TODO: track partial response sizes to ensure we don't overrequest too often
-			return res.Chain, nil
-		}
-
-		err = statusToError(res)
-		if err != nil {
-			log.Warnf("BlockSync peer %s response was an error: %s", p.String(), err)
-		}
+	validRes, err := client.doRequest(ctx, req, nil)
+	if err != nil {
+		return nil, err
 	}
 
-	if err == nil {
-		// FIXME: Is `no peers connected` the only possible reason of a
-		//  problem here?
-		return nil, xerrors.Errorf("GetChainMessages failed, no peers connected")
-	}
-
-	// TODO: What if we have no peers (and err is nil)?
-	return nil, xerrors.Errorf("GetChainMessages failed with all peers(%d): %w", len(peers), err)
+	return validRes.Messages, nil
 }
 
+// Send a request to a peer. Write request in the stream and read the
+// response back. We do not do any processing of the request/response
+// here.
 func (client *BlockSync) sendRequestToPeer(
 	ctx context.Context,
 	peer peer.ID,
@@ -282,49 +311,18 @@ func (client *BlockSync) sendRequestToPeer(
 	}()
 	// -- TRACE --
 
-	gsproto := string(gsnet.ProtocolGraphsync)
-	supp, err := client.host.Peerstore().SupportsProtocols(peer, BlockSyncProtocolID, gsproto)
+	supp, err := client.host.Peerstore().SupportsProtocols(peer, BlockSyncProtocolID)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get protocols for peer: %w", err)
 	}
-	if len(supp) == 0 {
-		return nil, xerrors.Errorf("peer %s supports no known sync protocols", peer)
+	if len(supp) == 0 || supp[0] != BlockSyncProtocolID {
+		return nil, xerrors.Errorf("peer %s does not support protocol %s",
+			peer, BlockSyncProtocolID)
+		// FIXME: `ProtoBook` should support a *single* protocol check that returns
+		//  a bool instead of a list.
 	}
 
-	// FIXME: Shouldn't we check all of them?
-	// FIXME: Make this just a check and fail early when merging functions.
-	switch supp[0] {
-	case BlockSyncProtocolID:
-		res, err := client.fetchBlocksBlockSync(ctx, peer, req)
-		if err != nil {
-			return nil, xerrors.Errorf("blocksync req failed: %w", err)
-		}
-		return res, nil
-	case gsproto:
-		res, err := client.fetchBlocksGraphSync(ctx, peer, req)
-		if err != nil {
-			return nil, xerrors.Errorf("graphsync req failed: %w", err)
-		}
-		return res, nil
-	default:
-		// FIXME: Just the first one, we don't check all.
-		return nil, xerrors.Errorf("peerstore somehow returned unexpected protocols: %v", supp)
-	}
-
-}
-
-// FIXME: Might be worth merging with `sendRequestToPeer` once
-//  that is cleaned up.
-//  Rename, we don't fetch anything here, just read the response
-//  of the request.
-func (client *BlockSync) fetchBlocksBlockSync(
-	ctx context.Context,
-	peer peer.ID,
-	req *BlockSyncRequest,
-) (*BlockSyncResponse, error) {
-	ctx, span := trace.StartSpan(ctx, "blockSyncFetch")
-	defer span.End()
-	start := build.Clock.Now()
+	connectionStart := build.Clock.Now()
 
 	// Open stream to peer.
 	stream, err := client.host.NewStream(
@@ -343,10 +341,10 @@ func (client *BlockSync) fetchBlocksBlockSync(
 		_ = stream.SetWriteDeadline(time.Time{})
 		// FIXME: What's the point of setting a blank deadline that won't time out?
 		//  Is this our way of clearing the old one?
-		client.peerTracker.logFailure(peer, build.Clock.Since(start))
+		client.peerTracker.logFailure(peer, build.Clock.Since(connectionStart))
 		return nil, err
 	}
-	// FIXME: Same. Why are we doing this again here?
+	// FIXME: Same, why are we doing this again here?
 	_ = stream.SetWriteDeadline(time.Time{})
 
 	// Read response.
@@ -356,68 +354,22 @@ func (client *BlockSync) fetchBlocksBlockSync(
 		bufio.NewReader(incrt.New(stream, 50<<10, 5*time.Second)),
 		&res)
 	if err != nil {
-		client.peerTracker.logFailure(peer, build.Clock.Since(start))
+		client.peerTracker.logFailure(peer, build.Clock.Since(connectionStart))
 		return nil, err
 	}
 
-	// FIXME: Move all this together with a defer as elsewhere. Maybe
-	//  we need to declare `res` in the signature.
+	// FIXME: Move all this together at the top using a defer as done elsewhere.
+	//  Maybe we need to declare `res` in the signature.
 	if span.IsRecordingEvents() {
 		span.AddAttributes(
 			trace.Int64Attribute("resp_status", int64(res.Status)),
-			trace.StringAttribute("msg", res.Message),
+			trace.StringAttribute("msg", res.ErrorMessage),
 			trace.Int64Attribute("chain_len", int64(len(res.Chain))),
 		)
 	}
 
-	client.peerTracker.logSuccess(peer, build.Clock.Since(start))
+	client.peerTracker.logSuccess(peer, build.Clock.Since(connectionStart))
 	return &res, nil
-}
-
-// process: Validate and extract.
-// Extract the chain from the response, creating one tipset at a time
-// and verifying each is connected to the next (its parent).
-// We are conflating status and validation errors here for simplicity in
-//  the code. // FIXME: Review this.
-// FIXME: We should penalize here (before returning) the peer. This should
-//  have a separate validation function maybe.
-// FIXME: Check request. Check connections.
-func (client *BlockSync) processResponse(
-	req *BlockSyncRequest,
-	res *BlockSyncResponse,
-) ([]*types.TipSet, error) {
-	err := statusToError(res)
-	if err != nil {
-		return nil, xerrors.Errorf("status error: %s", err)
-	}
-
-	if len(res.Chain) == 0 {
-		// FIXME: We assume here then that count > 1. That should be in the
-		//  protocol.
-		return nil, xerrors.Errorf("got no blocks in successful response")
-	}
-
-	head, err := types.NewTipSet(res.Chain[0].Blocks)
-	if err != nil {
-		return nil, err
-	}
-	validChain := []*types.TipSet{head}
-	for i := 1; i < len(res.Chain); i++ {
-		parent, err := types.NewTipSet(res.Chain[i].Blocks)
-		if err != nil {
-			return nil, err
-		}
-
-		if parent.IsParentOf(head) == false {
-			return nil, fmt.Errorf("tipsets [%d-%d] are not connected",
-				i-1, i)
-			// FIXME: Give more information here, maybe CIDs.
-		}
-
-		validChain = append(validChain, parent)
-		head = parent
-	}
-	return validChain, nil
 }
 
 func (client *BlockSync) AddPeer(p peer.ID) {
@@ -452,139 +404,4 @@ func shufflePrefix(peers []peer.ID) {
 	}
 
 	copy(peers, buf)
-}
-
-
-const (
-
-	// AMT selector recursion. An AMT has arity of 8 so this gives allows
-	// us to retrieve trees with 8^10 (1,073,741,824) elements.
-	amtRecursionDepth = uint32(10)
-
-	// some constants for looking up tuple encoded struct fields
-	// field index of Parents field in a block header
-	blockIndexParentsField = 5
-
-	// field index of Messages field in a block header
-	blockIndexMessagesField = 10
-
-	// field index of AMT node in AMT head
-	amtHeadNodeFieldIndex = 2
-
-	// field index of links array AMT node
-	amtNodeLinksFieldIndex = 1
-
-	// field index of values array AMT node
-	amtNodeValuesFieldIndex = 2
-
-	// maximum depth per traversal
-	maxRequestLength = 50
-)
-
-var amtSelector selectorbuilder.SelectorSpec
-
-func init() {
-	// builer for selectors
-	ssb := selectorbuilder.NewSelectorSpecBuilder(basicnode.Style.Any)
-	// amt selector -- needed to selector through a messages AMT
-	amtSelector = ssb.ExploreIndex(amtHeadNodeFieldIndex,
-		ssb.ExploreRecursive(ipldselector.RecursionLimitDepth(int(amtRecursionDepth)),
-			ssb.ExploreUnion(
-				ssb.ExploreIndex(amtNodeLinksFieldIndex,
-					ssb.ExploreAll(ssb.ExploreRecursiveEdge())),
-				ssb.ExploreIndex(amtNodeValuesFieldIndex,
-					ssb.ExploreAll(ssb.Matcher())))))
-}
-
-func selectorForRequest(req *BlockSyncRequest) ipld.Node {
-	// builer for selectors
-	ssb := selectorbuilder.NewSelectorSpecBuilder(basicnode.Style.Any)
-
-	bso := ParseBSOptions(req.Options)
-	if bso.IncludeMessages {
-		return ssb.ExploreRecursive(ipldselector.RecursionLimitDepth(int(req.RequestLength)),
-			ssb.ExploreIndex(blockIndexParentsField,
-				ssb.ExploreUnion(
-					ssb.ExploreAll(
-						ssb.ExploreIndex(blockIndexMessagesField,
-							ssb.ExploreRange(0, 2, amtSelector),
-						)),
-					ssb.ExploreIndex(0, ssb.ExploreRecursiveEdge()),
-				))).Node()
-	}
-	return ssb.ExploreRecursive(ipldselector.RecursionLimitDepth(int(req.RequestLength)), ssb.ExploreIndex(blockIndexParentsField,
-		ssb.ExploreUnion(
-			ssb.ExploreAll(
-				ssb.Matcher(),
-			),
-			ssb.ExploreIndex(0, ssb.ExploreRecursiveEdge()),
-		))).Node()
-}
-
-func firstTipsetSelector(req *BlockSyncRequest) ipld.Node {
-	// builer for selectors
-	ssb := selectorbuilder.NewSelectorSpecBuilder(basicnode.Style.Any)
-
-	bso := ParseBSOptions(req.Options)
-	if bso.IncludeMessages {
-		return ssb.ExploreIndex(blockIndexMessagesField,
-			ssb.ExploreRange(0, 2, amtSelector),
-		).Node()
-	}
-	return ssb.Matcher().Node()
-
-}
-
-func (client *BlockSync) executeGsyncSelector(ctx context.Context, p peer.ID, root cid.Cid, sel ipld.Node) error {
-	extension := graphsync.ExtensionData{
-		Name: "chainsync",
-		Data: nil,
-	}
-	_, errs := client.gsync.Request(ctx, p, cidlink.Link{Cid: root}, sel, extension)
-
-	for err := range errs {
-		return xerrors.Errorf("failed to complete graphsync request: %w", err)
-	}
-	return nil
-}
-
-// Fallback for interacting with other non-lotus nodes
-func (client *BlockSync) fetchBlocksGraphSync(ctx context.Context, p peer.ID, req *BlockSyncRequest) (*BlockSyncResponse, error) {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	immediateTsSelector := firstTipsetSelector(req)
-
-	// Do this because we can only request one root at a time
-	for _, r := range req.Start {
-		if err := client.executeGsyncSelector(ctx, p, r, immediateTsSelector); err != nil {
-			return nil, err
-		}
-	}
-
-	if req.RequestLength > maxRequestLength {
-		req.RequestLength = maxRequestLength
-	}
-
-	sel := selectorForRequest(req)
-
-	// execute the selector forreal
-	if err := client.executeGsyncSelector(ctx, p, req.Start[0], sel); err != nil {
-		return nil, err
-	}
-
-	// Now pull the data we fetched out of the chainstore (where it should now be persisted)
-	tempcs := store.NewChainStore(client.bserv.Blockstore(), datastore.NewMapDatastore(), nil)
-
-	validReq, errResponse := validateRequest(ctx, req)
-	if errResponse != nil {
-		return errResponse, nil
-	}
-
-	chain, err := collectChainSegment(tempcs, validReq)
-	if err != nil {
-		return nil, xerrors.Errorf("failed to load chain data from chainstore after successful graphsync response (start = %v): %w", req.Start, err)
-	}
-
-	return &BlockSyncResponse{Chain: chain}, nil
 }
