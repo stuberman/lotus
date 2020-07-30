@@ -7,8 +7,6 @@ import (
 	"math/rand"
 	"time"
 
-	bserv "github.com/ipfs/go-blockservice"
-	graphsync "github.com/ipfs/go-graphsync"
 	host "github.com/libp2p/go-libp2p-core/host"
 	inet "github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
@@ -21,81 +19,89 @@ import (
 	"github.com/filecoin-project/lotus/chain/types"
 	incrt "github.com/filecoin-project/lotus/lib/increadtimeout"
 	"github.com/filecoin-project/lotus/lib/peermgr"
-	"github.com/filecoin-project/lotus/node/modules/dtypes"
 )
 
-// Block synchronization client.
-// FIXME: Rename to just `Client`.
-// FIXME: What's its API? What can we do with it? Not just request blocks.
+// Protocol client.
+// FIXME: Rename to just `Client`. Not done at the moment to avoid
+//  disrupt too much of the consumer code, should be done along
+//  https://github.com/filecoin-project/lotus/issues/2612.
 type BlockSync struct {
-	// FIXME: Why does the client access the *entire* service?
-	//  We are only using the IPFS `BlockGetter` interface.
-	bserv bserv.BlockService
-	gsync graphsync.GraphExchange
-	// Used to manage connection to our peers through the protocol.
-	// FIXME: We should have a reduced set here, just initialized
-	//  with our protocol ID, we shouldn't be able to open *any*
+	// Connection manager used to contact the server.
+	// FIXME: We should have a reduced interface here, initialized
+	//  just with our protocol ID, we shouldn't be able to open *any*
 	//  connection.
 	host  host.Host
 
 	peerTracker *bsPeerTracker
-
-	// FIXME: Do we even use this?
-	peerMgr     *peermgr.PeerMgr
 }
 
-func NewBlockSyncClient(
-	// FIXME: REMOVE THIS.
-	bserv dtypes.ChainBlockService,
-	h host.Host,
+func NewClient(
+	host host.Host,
 	pmgr peermgr.MaybePeerMgr,
-	gs dtypes.Graphsync,
 ) *BlockSync {
 	return &BlockSync{
-		// FIXME: REMOVE.
-		bserv:       bserv,
-		host:        h,
+		host:        host,
 		peerTracker: newPeerTracker(pmgr.Mgr),
-		// FIXME: REMOVE.
-		peerMgr:     pmgr.Mgr,
-		gsync:       gs,
 	}
 }
 
-// Internal single point of entry to the client request processing
-// servicing the external-facing API. Currently we have 3 very
-// heterogeneous services exposed:
-// * GetBlocks:         BSOptBlocks
-// * GetFullTipSet:     BSOptBlocks | BSOptMessages
-// * GetChainMessages:                BSOptMessages
+// Main logic of the client request service. The provided `Request`
+// is sent to the `singlePeer` if one is indicated or to all available
+// ones otherwise. The response is processed and validated according
+// to the `Request` options. Either a `ValidatedResponse` is returned
+// (which can be safely accessed), or an `error` that may represent
+// either a response error status, a failed validation or an internal
+// error.
+//
+// This is the internal single-point-of-entry for all external-facing
+// APIs, currently we have 3 very heterogeneous services exposed:
+// * GetBlocks:         Headers
+// * GetFullTipSet:     Headers | Messages
+// * GetChainMessages:            Messages
 // This function handles all the different combinations of the available
 // request options without disrupting external calls. In the future the
 // consumers should be forced to use a more standardized service and
 // adhere to a single API derived from this function.
 func (client *BlockSync) doRequest(
 	ctx context.Context,
-	req *BlockSyncRequest,
-	// FIXME: Document.
+	req *Request,
 	singlePeer *peer.ID,
 ) (*ValidatedResponse, error) {
+		// Validate request.
+		if req.Length == 0 {
+			return nil, xerrors.Errorf("invalid request of length 0")
+		}
+		if req.Length > MaxRequestLength {
+			return nil, xerrors.Errorf("request length (%d) above maximum (%d)",
+				req.Length, MaxRequestLength)
+		}
+		if req.Options == 0 {
+			return nil, xerrors.Errorf("request with no options set")
+		}
+
+		// Generate the list of peers to be queried, either the
+		// `singlePeer` indicated or all peers available (sorted
+		// by an internal peer tracker with some randomness injected).
 	var peers []peer.ID
 	if singlePeer != nil {
 		peers = []peer.ID{*singlePeer}
 	} else {
 		peers := client.getShuffledPeers()
 		if len(peers) == 0 {
-			return nil, xerrors.Errorf("GetBlocks failed: no peers available")
+			return nil, xerrors.Errorf("no peers available")
 		}
 	}
 
-	// Try for each peer available, return on the first successful response.
-	startTime := build.Clock.Now() // FIXME: Should we track time per peer instead?
+	// Try the request for each peer in the list,
+	// return on the first successful response.
+	// FIXME: Doing this serially isn't great, but fetching in parallel
+	//  may not be a good idea either. Think about this more.
+	startTime := build.Clock.Now()
+	// FIXME: Should we track time per peer instead of a global one?
 	for _, peer := range peers {
-		// FIXME: doing this synchronously isn't great, but fetching in parallel
-		//  may not be a good idea either. Think about this more.
 		select {
 		case <-ctx.Done():
-			return nil, xerrors.Errorf("doRequest failed: %w", ctx.Err())
+			return nil, xerrors.Errorf("context cancelled: %w", ctx.Err())
 		default:
 		}
 
@@ -103,102 +109,134 @@ func (client *BlockSync) doRequest(
 		res, err := client.sendRequestToPeer(ctx, peer, req)
 		if err != nil {
 			if !xerrors.Is(err, inet.ErrNoConn) {
-				log.Warnf("doRequest failed for peer %s: %s",
+				log.Warnf("could not connect to peer %s: %s",
 					peer.String(), err)
 			}
 			continue
 		}
 
-		// Parse response answer.
-
-		// Verify blocks.
-		// FIXME: Is there something we can verify from the messages?
-
-		// Process: extract blocks into the tipset, return that, which
-		// can be consumed directly by GetBlocks.
-
-
+		// Process and validate response.
 		validRes, err := client.processResponse(req, res)
 		if err != nil {
-			log.Warnf("peer %s response failed: %s",
+			log.Warnf("processing peer %s response failed: %s",
 				peer.String(), err)
 			continue
 		}
 
 		client.peerTracker.logGlobalSuccess(build.Clock.Since(startTime))
-		// FIXME: Extract constant.
-		client.host.ConnManager().TagPeer(peer, "bsync", 25)
+		client.host.ConnManager().TagPeer(peer, "bsync", SUCCESS_PEER_TAG_VALUE)
 		return validRes, nil
-
 	}
 
-	// FIXME: REport a separte failed for single peer error.
-	return nil, xerrors.Errorf("GetBlocks failed with all peers")
+	errString := "doRequest failed for all peers"
+	if singlePeer != nil {
+		errString = "doRequest failed for single peer"
+		// (The peer has already been logged before, don't print it again.)
+	}
+	return nil, xerrors.Errorf(errString)
 }
 
-// process: Validate and extract.
-// Extract the chain from the response, creating one tipset at a time
-// and verifying each is connected to the next (its parent).
-// We are conflating status and validation errors here for simplicity in
-//  the code. // FIXME: Review this.
-// FIXME: We should penalize here (before returning) the peer. This should
-//  have a separate validation function maybe.
-// FIXME: Check request parent (that start matches first). Check connections.
+// Process and validate response. Check the status and that the information
+// returned matches the request (and its integrity). Extract the information
+// into a `ValidatedResponse` for the external-facing APIs to select what they
+// want.
+//
+// We are conflating in the single error returned both status and validation
+// errors. Peer penalization should happen here then, before returning, so
+// we can apply the correct penalties depending on the cause of the error.
 func (client *BlockSync) processResponse(
-	req *BlockSyncRequest,
-	res *BlockSyncResponse,
+	req *Request,
+	res *Response,
+	// FIXME: Add the `peer` as argument once we implement penalties.
 ) (validRes *ValidatedResponse, err error) {
 	err = res.statusToError()
 	if err != nil {
 		return nil, xerrors.Errorf("status error: %s", err)
 	}
 
-	if len(res.Chain) == 0 {
-		// FIXME: We assume here then that count > 1. That should be in the
-		//  protocol.
-		return nil, xerrors.Errorf("got no blocks in successful response")
-	}
-	if len(res.Chain) > int(req.RequestLength) {
-		return nil, xerrors.Errorf("got longer response (%d) than requested (%d)",
-			len(res.Chain), req.RequestLength)
-	}
-
 	options := parseOptions(req.Options)
+	if options.noOptionsSet() {
+		// Safety check, this shouldn't happen, and even if it did
+		// it should be caught by the peer in its error status.
+		return nil, xerrors.Errorf("nothing was requested")
+	}
 
-	if options.IncludeBlocks {
-		validRes.Tipsets = make([]*types.TipSet, req.RequestLength)
-		// FIXME: Just do a single for to extract into tipsets, then
-		//  another to check parents that ignores the first index (starts at 1).
-		//  Avoid this head/parent and append artifacts.
-		head, err := types.NewTipSet(res.Chain[0].Blocks)
-		if err != nil {
-			return nil, err
-		}
-		validRes.Tipsets[0] = head
-		for i := 1; i < len(res.Chain); i++ {
-			parent, err := types.NewTipSet(res.Chain[i].Blocks)
+	// Verify that the chain segment returned is in the valid range.
+	// Note that the returned length might be less than requested.
+	resLength := len(res.Chain)
+	if resLength == 0 {
+		return nil, xerrors.Errorf("got no chain in successful response")
+	}
+	if resLength > int(req.Length) {
+		return nil, xerrors.Errorf("got longer response (%d) than requested (%d)",
+			resLength, req.Length)
+	}
+	if resLength < int(req.Length) && res.Status != Partial {
+		return nil, xerrors.Errorf("got less than requested without a proper status: %s", res.Status)
+	}
+
+	if options.IncludeHeaders {
+		// Check for valid block sets and extract them into `TipSet`s.
+		validRes.Tipsets = make([]*types.TipSet, resLength)
+		for i := 0; i < resLength; i++ {
+			validRes.Tipsets[i], err = types.NewTipSet(res.Chain[i].Blocks)
 			if err != nil {
-				return nil, err
+				return nil, xerrors.Errorf("invalid tipset blocks at height (head - %d): %w", i, err)
 			}
+		}
 
-			if parent.IsParentOf(head) == false {
-				return nil, fmt.Errorf("tipsets [%d-%d] are not connected",
-					i-1, i)
-				// FIXME: Give more information here, maybe CIDs.
+		// Check that the returned head matches the one requested.
+		if !types.CidArrsEqual(validRes.Tipsets[0].Cids(), req.Head) {
+			return nil, xerrors.Errorf("returned chain head does not match request")
+		}
+
+		// Check `TipSet` are connected (valid chain).
+		for i := 0; i < len(validRes.Tipsets) - 1; i++ {
+			if validRes.Tipsets[i].IsParentOf(validRes.Tipsets[i+1]) == false {
+				return nil, fmt.Errorf("tipsets are not connected at height (head - %d)/(head - %d)",
+					i, i+1)
+				// FIXME: Maybe give more information here, like CIDs.
 			}
-
-			validRes.Tipsets[i] = parent
-			head = parent
 		}
 	}
 
 	if options.IncludeMessages {
-		validRes.Messages = make([]*CompactedMessages, req.RequestLength)
-		for i, tipset := range res.Chain {
-			validRes.Messages[i] = tipset.Messages
+		validRes.Messages = make([]*CompactedMessages, resLength)
+		for i := 0; i < resLength; i++ {
+			validRes.Messages[i] = res.Chain[i].Messages
 		}
-		// FIXME: Any check we can do here? Does it depends on having blocks?
-		//  IF the blocks are present check that they match indexes for toFullTipSets.
+
+		if options.IncludeHeaders {
+			// If the headers were also returned check that the compression
+			// indexes are valid before `toFullTipSets()` is called by the
+			// consumer.
+			for tipsetIdx := 0; tipsetIdx < resLength; tipsetIdx++ {
+				msgs := res.Chain[tipsetIdx].Messages
+				blocksNum := len(res.Chain[tipsetIdx].Blocks)
+				if len(msgs.BlsIncludes) != blocksNum {
+					return nil, xerrors.Errorf("BlsIncludes (%d) does not match number of blocks (%d)",
+						len(msgs.BlsIncludes), blocksNum)
+				}
+				if len(msgs.SecpkIncludes) != blocksNum {
+					return nil, xerrors.Errorf("SecpkIncludes (%d) does not match number of blocks (%d)",
+						len(msgs.SecpkIncludes), blocksNum)
+				}
+				for blockIdx := 0; blockIdx < blocksNum; blockIdx++ {
+					for _, mi := range msgs.BlsIncludes[blockIdx] {
+						if int(mi) >= len(msgs.Bls) {
+							return nil, xerrors.Errorf("index in BlsIncludes (%d) exceeds number of messages (%d)",
+								mi, len(msgs.Bls))
+						}
+					}
+					for _, mi := range msgs.SecpkIncludes[blockIdx] {
+						if int(mi) >= len(msgs.Secpk) {
+							return nil, xerrors.Errorf("index in SecpkIncludes (%d) exceeds number of messages (%d)",
+								mi, len(msgs.Secpk))
+						}
+					}
+				}
+			}
+		}
 	}
 
 	return validRes, nil
@@ -223,10 +261,10 @@ func (client *BlockSync) GetBlocks(
 		)
 	}
 
-	req := &BlockSyncRequest{
-		Start:         tsk.Cids(),
-		RequestLength: uint64(count),
-		Options:       BSOptBlocks,
+	req := &Request{
+		Head:    tsk.Cids(),
+		Length:  uint64(count),
+		Options: Headers,
 	}
 
 	validRes, err := client.doRequest(ctx, req, nil)
@@ -244,10 +282,10 @@ func (client *BlockSync) GetFullTipSet(
 ) (*store.FullTipSet, error) {
 	// TODO: round robin through these peers on error
 
-	req := &BlockSyncRequest{
-		Start:         tsk.Cids(),
-		RequestLength: 1,
-		Options:       BSOptBlocks | BSOptMessages,
+	req := &Request{
+		Head:    tsk.Cids(),
+		Length:  1,
+		Options: Headers | Messages,
 	}
 
 	validRes, err := client.doRequest(ctx, req, &peer)
@@ -262,17 +300,16 @@ func (client *BlockSync) GetFullTipSet(
 
 func (client *BlockSync) GetChainMessages(
 	ctx context.Context,
-	// FIXME: Standard naming.
-	h *types.TipSet,
-	count uint64,
+	head *types.TipSet,
+	length uint64,
 	) ([]*CompactedMessages, error) {
 	ctx, span := trace.StartSpan(ctx, "GetChainMessages")
 	defer span.End()
 
-	req := &BlockSyncRequest{
-		Start:         h.Cids(),
-		RequestLength: count,
-		Options:       BSOptMessages,
+	req := &Request{
+		Head:    head.Cids(),
+		Length:  length,
+		Options: Messages,
 	}
 
 	validRes, err := client.doRequest(ctx, req, nil)
@@ -289,8 +326,8 @@ func (client *BlockSync) GetChainMessages(
 func (client *BlockSync) sendRequestToPeer(
 	ctx context.Context,
 	peer peer.ID,
-	req *BlockSyncRequest,
-) (_ *BlockSyncResponse, err error) {
+	req *Request,
+) (_ *Response, err error) {
 	// Trace code.
 	ctx, span := trace.StartSpan(ctx, "sendRequestToPeer")
 	defer span.End()
@@ -311,11 +348,11 @@ func (client *BlockSync) sendRequestToPeer(
 	}()
 	// -- TRACE --
 
-	supp, err := client.host.Peerstore().SupportsProtocols(peer, BlockSyncProtocolID)
+	supported, err := client.host.Peerstore().SupportsProtocols(peer, BlockSyncProtocolID)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get protocols for peer: %w", err)
 	}
-	if len(supp) == 0 || supp[0] != BlockSyncProtocolID {
+	if len(supported) == 0 || supported[0] != BlockSyncProtocolID {
 		return nil, xerrors.Errorf("peer %s does not support protocol %s",
 			peer, BlockSyncProtocolID)
 		// FIXME: `ProtoBook` should support a *single* protocol check that returns
@@ -335,8 +372,7 @@ func (client *BlockSync) sendRequestToPeer(
 	}
 
 	// Write request.
-	// FIXME: Extract deadline constant.
-	_ = stream.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	_ = stream.SetWriteDeadline(time.Now().Add(WRITE_REQ_DEADLINE))
 	if err := cborutil.WriteCborRPC(stream, req); err != nil {
 		_ = stream.SetWriteDeadline(time.Time{})
 		// FIXME: What's the point of setting a blank deadline that won't time out?
@@ -348,10 +384,10 @@ func (client *BlockSync) sendRequestToPeer(
 	_ = stream.SetWriteDeadline(time.Time{})
 
 	// Read response.
-	var res BlockSyncResponse
+	var res Response
 	err = cborutil.ReadCborRPC(
 		// FIXME: Extract constants.
-		bufio.NewReader(incrt.New(stream, 50<<10, 5*time.Second)),
+		bufio.NewReader(incrt.New(stream, READ_RES_MIN_SPEED, READ_RES_DEADLINE)),
 		&res)
 	if err != nil {
 		client.peerTracker.logFailure(peer, build.Clock.Since(connectionStart))
@@ -391,8 +427,7 @@ func (client *BlockSync) getShuffledPeers() []peer.ID {
 }
 
 func shufflePrefix(peers []peer.ID) {
-	// FIXME: Extract.
-	prefix := 5
+	prefix := SHUFFLE_PEERS_PREFIX
 	if len(peers) < prefix {
 		prefix = len(peers)
 	}

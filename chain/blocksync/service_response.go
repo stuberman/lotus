@@ -47,20 +47,20 @@ func NewBlockSyncService(cs *store.ChainStore) *BlockSyncService {
 	}
 }
 
-// Entry point of the service, handles `BlockSyncRequest`s.
+// Entry point of the service, handles `Request`s.
 func (bss *BlockSyncService) HandleStream(stream inet.Stream) {
 	ctx, span := trace.StartSpan(context.Background(), "blocksync.HandleStream")
 	defer span.End()
 
 	defer stream.Close() //nolint:errcheck
 
-	var req BlockSyncRequest
+	var req Request
 	if err := cborutil.ReadCborRPC(bufio.NewReader(stream), &req); err != nil {
 		log.Warnf("failed to read block sync request: %s", err)
 		return
 	}
 	log.Infow("block sync request",
-		"start", req.Start, "len", req.RequestLength)
+		"start", req.Head, "len", req.Length)
 
 	resp, err := bss.processRequest(ctx, &req)
 	if err != nil {
@@ -78,11 +78,11 @@ func (bss *BlockSyncService) HandleStream(stream inet.Stream) {
 	}
 }
 
-// `BlockSyncRequest` processed and validated to query the tipsets needed.
+// `Request` processed and validated to query the tipsets needed.
 type validatedRequest struct {
 	startTipset         types.TipSetKey
 	count uint64
-	options *BSOptions
+	options *parsedOptions
 }
 
 // Validate and service the request. We return either a protocol
@@ -90,8 +90,8 @@ type validatedRequest struct {
 // a protocol error itself (e.g., invalid request).
 func (bss *BlockSyncService) processRequest(
 	ctx context.Context,
-	req *BlockSyncRequest,
-) (*BlockSyncResponse, error) {
+	req *Request,
+) (*Response, error) {
 	validReq, errResponse := validateRequest(ctx, req)
 	if errResponse != nil {
 		// The request did not pass validation, return the response
@@ -107,13 +107,13 @@ func (bss *BlockSyncService) processRequest(
 // * limited count.
 // * `TipSetKey` generated from CIDs.
 // FIXME: Document in more length the validations.
-// We either return a `validatedRequest` or a `BlockSyncResponse`
+// We either return a `validatedRequest` or a `Response`
 //  indicating the error why we can't process it. It does not have
 //  any internal errors, it just signals protocol ones.
 func validateRequest(
 	ctx context.Context,
-	req *BlockSyncRequest,
-) (*validatedRequest, *BlockSyncResponse) {
+	req *Request,
+) (*validatedRequest, *Response) {
 	_, span := trace.StartSpan(ctx, "blocksync.ValidateRequest")
 	defer span.End()
 
@@ -121,25 +121,25 @@ func validateRequest(
 
 	validReq.options = parseOptions(req.Options)
 
-	// FIXME: Consider returning StatusBadRequest here.
-	validReq.count = req.RequestLength
-	if validReq.count > BlockSyncMaxRequestLength {
+	// FIXME: Consider returning BadRequest here.
+	validReq.count = req.Length
+	if validReq.count > MaxRequestLength {
 		log.Warnw("limiting blocksync request length",
-			"orig", req.RequestLength)
-		validReq.count = BlockSyncMaxRequestLength
+			"orig", req.Length)
+		validReq.count = MaxRequestLength
 	}
 
-	if len(req.Start) == 0 {
-		return nil, &BlockSyncResponse{
-			Status:       StatusBadRequest,
+	if len(req.Head) == 0 {
+		return nil, &Response{
+			Status:       BadRequest,
 			ErrorMessage: "no cids given in blocksync request",
 		}
 	}
-	validReq.startTipset = types.NewTipSetKey(req.Start...)
+	validReq.startTipset = types.NewTipSetKey(req.Head...)
 
 	// FIXME: Add it to the defer at the start.
 	span.AddAttributes(
-		trace.BoolAttribute("blocks", validReq.options.IncludeBlocks),
+		trace.BoolAttribute("blocks", validReq.options.IncludeHeaders),
 		trace.BoolAttribute("messages", validReq.options.IncludeMessages),
 		trace.Int64Attribute("reqlen", int64(validReq.count)),
 	)
@@ -150,7 +150,7 @@ func validateRequest(
 func (bss *BlockSyncService) serviceRequest(
 	ctx context.Context,
 	req *validatedRequest,
-	) (*BlockSyncResponse, error) {
+	) (*Response, error) {
 	_, span := trace.StartSpan(ctx, "blocksync.ServiceRequest")
 	defer span.End()
 
@@ -158,18 +158,18 @@ func (bss *BlockSyncService) serviceRequest(
 	chain, err := collectChainSegment(bss.cs, req)
 	if err != nil {
 		log.Warn("block sync request: collectChainSegment failed: ", err)
-		return &BlockSyncResponse{
-			Status:       StatusInternalError,
+		return &Response{
+			Status:       InternalError,
 			ErrorMessage: err.Error(),
 		}, nil
 	}
 
-	status := StatusOK
+	status := Ok
 	if len(chain) < int(req.count) {
-		status = StatusPartial
+		status = Partial
 	}
 
-	return &BlockSyncResponse{
+	return &Response{
 		Chain:  chain,
 		Status: status,
 	}, nil
@@ -203,7 +203,7 @@ func collectChainSegment(
 			bst.Messages.SecpkIncludes = smincl
 		}
 
-		if req.options.IncludeBlocks {
+		if req.options.IncludeHeaders {
 			bst.Blocks = ts.Blocks()
 		}
 
@@ -219,7 +219,6 @@ func collectChainSegment(
 	}
 }
 
-// FIXME: DRY. Use messages interface.
 func gatherMessages(cs *store.ChainStore, ts *types.TipSet) ([]*types.Message, [][]uint64, []*types.SignedMessage, [][]uint64, error) {
 	blsmsgmap := make(map[cid.Cid]uint64)
 	secpkmsgmap := make(map[cid.Cid]uint64)
@@ -233,7 +232,7 @@ func gatherMessages(cs *store.ChainStore, ts *types.TipSet) ([]*types.Message, [
 			return nil, nil, nil, nil, err
 		}
 
-		// FIXME: What is going on here? Why do we keep track of this?
+		// FIXME: DRY. Use `chain.Message` interface.
 		bmi := make([]uint64, 0, len(bmsgs))
 		for _, m := range bmsgs {
 			i, ok := blsmsgmap[m.Cid()]

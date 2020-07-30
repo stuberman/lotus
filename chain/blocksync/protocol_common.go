@@ -3,6 +3,7 @@ package blocksync
 import (
 	"context"
 	"github.com/filecoin-project/lotus/chain/store"
+	"time"
 
 	"golang.org/x/xerrors"
 	"github.com/libp2p/go-libp2p-core/peer"
@@ -21,94 +22,109 @@ type NewStreamFunc func(context.Context, peer.ID, ...protocol.ID) (network.Strea
 
 const BlockSyncProtocolID = "/fil/sync/blk/0.0.1"
 
-const BlockSyncMaxRequestLength = 800
+const MaxRequestLength = 800
 
+// Extracted constants from the code.
+// FIXME: Should be reviewed and confirmed.
+const SUCCESS_PEER_TAG_VALUE = 25
+const WRITE_REQ_DEADLINE = 5 * time.Second
+const READ_RES_DEADLINE = WRITE_REQ_DEADLINE
+const READ_RES_MIN_SPEED = 50<<10
+const SHUFFLE_PEERS_PREFIX = 5
 
-type BlockSyncRequest struct {
-	// List of CIDs comprising a `TipSetKey` from where to start fetching.
+// FIXME: Rename. Make private.
+type Request struct {
+	// List of ordered CIDs comprising a `TipSetKey` from where to start
+	// fetching backwards.
 	// FIXME: Why don't we send a `TipSetKey` instead of converting back
 	//  and forth?
-	Start         []cid.Cid
-	// Number of block sets to fetch from `Start`.
-	// FIXME: Including start?
-	// FIXME: Rename, remove `Request` and change Length to `Count`
-	//  or similar.
-	RequestLength uint64
-
+	Head []cid.Cid
+	// Number of block sets to fetch from `Head` (inclusive, should always
+	// be in the range `[1, MaxRequestLength]`).
+	Length uint64
+	// Request options, see `Options` type for more details. Compressed
+	// in a single `uint64` to save space.
 	Options uint64
 }
 
-type BSOptions struct {
-	IncludeBlocks   bool
+// Request options. When fetching the chain segment we can fetch
+// either block headers, messages, or both.
+const (
+	Headers = 1 << iota
+	Messages
+)
+
+// Decompressed options into separate struct members for easy access
+// during internal processing..
+type parsedOptions struct {
+	IncludeHeaders  bool
 	IncludeMessages bool
 }
 
-func parseOptions(optfield uint64) *BSOptions {
-	return &BSOptions{
-		IncludeBlocks:   optfield&(BSOptBlocks) != 0,
-		IncludeMessages: optfield&(BSOptMessages) != 0,
+func (options *parsedOptions) noOptionsSet() bool {
+	return options.IncludeHeaders == false &&
+		options.IncludeMessages == false
+}
+
+func parseOptions(optfield uint64) *parsedOptions {
+	return &parsedOptions{
+		IncludeHeaders:  optfield&(uint64(Headers)) != 0,
+		IncludeMessages: optfield&(uint64(Messages)) != 0,
 	}
 }
 
-type BlockSyncResponse struct {
-	Chain []*BSTipSet
-
-	Status       uint64
+// FIXME: Rename. Make private.
+type Response struct {
+	Status       status
+	// String that complements the error status when converting to an
+	// internal error (see `statusToError()`).
 	ErrorMessage string
+
+	Chain []*BSTipSet
 }
 
+type status uint64
 const (
-	StatusOK            = uint64(0)
-	// We could not fetch all blocks requested.
-	StatusPartial       = uint64(101)
-	StatusNotFound      = uint64(201)
-	StatusGoAway        = uint64(202)
-	StatusInternalError = uint64(203)
-	StatusBadRequest    = uint64(204)
-)
+	Ok status = 0
+	// We could not fetch all blocks requested (but at least we returned
+	// the `Head` requested). Not considered an error.
+	Partial = 101
 
-// FIXME: Type these.
-const (
-	// FIXME: This seems like it should be implicit in the protocol,
-	// is there a case we don't want the blocks? The messages are
-	//  not (cannot) be transported alone. GetChainMessages does not
-	//  use it.
-	// FIXME: Rename to tipsets or block headers
-	BSOptBlocks = 1 << iota
-	BSOptMessages
+	// Errors
+	NotFound      = 201
+	GoAway        = 202
+	InternalError = 203
+	BadRequest    = 204
 )
 
 // Convert status to internal error.
-// FIXME: Check request.
-// FIXME: This error strings are repeated elsewhere.
-// FIXME: Should be in the common file.
-func (res *BlockSyncResponse) statusToError() error {
+func (res *Response) statusToError() error {
 	switch res.Status {
-	case StatusOK, StatusPartial:
-		// FIXME: Consider if we want to not process `StatusPartial`
-		//  and return an error.
+	case Ok, Partial:
 		return nil
-	case StatusNotFound:
+		// FIXME: Consider if we want to not process `Partial` responses
+		//  and return an error instead.
+	case NotFound:
 		return xerrors.Errorf("not found")
-	case StatusGoAway:
+	case GoAway:
 		return xerrors.Errorf("not handling 'go away' blocksync responses yet")
-	case StatusInternalError:
+	case InternalError:
 		return xerrors.Errorf("block sync peer errored: %s", res.ErrorMessage)
-	case StatusBadRequest:
+	case BadRequest:
 		return xerrors.Errorf("block sync request invalid: %s", res.ErrorMessage)
 	default:
 		return xerrors.Errorf("unrecognized response code: %d", res.Status)
 	}
 }
 
-// FIXME: BlockSync representation of a tipset?
-// FIXME: Use the chain message abstraction and do not repeat so much code.
+// FIXME: Rename.
 type BSTipSet struct {
 	Blocks []*types.BlockHeader
     Messages *CompactedMessages
 }
 
-// FIXME: Describe format.
+// FIXME: Describe format. The `Includes` seem to index
+//  from block to message.
 // FIXME: The logic of this function should belong to it, not
 //  to the consumer.
 type CompactedMessages struct {
@@ -119,19 +135,22 @@ type CompactedMessages struct {
 	SecpkIncludes [][]uint64
 }
 
+// Response that has been validated according to the protocol
+// and can be safely accessed.
+// FIXME: Maybe rename to verified, keep consistent naming.
 type ValidatedResponse struct {
-	// Only the BSTipSet with blocks and messages.
 	Tipsets []*types.TipSet
-
 	Messages []*CompactedMessages
 }
 
-// Decompress messages and form full tipsets.
+// Decompress messages and form full tipsets with them. The headers
+// need to have been requested as well.
 func (res *ValidatedResponse) toFullTipSets() ([]*store.FullTipSet) {
 	if len(res.Tipsets) == 0 {
-		// This decompression can only be done if both blocks and
+		// This decompression can only be done if both headers and
 		// messages are returned in the response.
-		// FIXME: Do we need to check the messages are present also?
+		// FIXME: Do we need to check the messages are present also? The validation
+		//  would seem to imply this is unnecessary, can be added just in case.
 		return nil
 	}
 	ftsList := make([]*store.FullTipSet, len(res.Tipsets))

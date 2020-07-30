@@ -14,36 +14,36 @@ import (
 
 var _ = xerrors.Errorf
 
-var lengthBufBlockSyncRequest = []byte{131}
+var lengthBufRequest = []byte{131}
 
-func (t *BlockSyncRequest) MarshalCBOR(w io.Writer) error {
+func (t *Request) MarshalCBOR(w io.Writer) error {
 	if t == nil {
 		_, err := w.Write(cbg.CborNull)
 		return err
 	}
-	if _, err := w.Write(lengthBufBlockSyncRequest); err != nil {
+	if _, err := w.Write(lengthBufRequest); err != nil {
 		return err
 	}
 
 	scratch := make([]byte, 9)
 
-	// t.Start ([]cid.Cid) (slice)
-	if len(t.Start) > cbg.MaxLength {
-		return xerrors.Errorf("Slice value in field t.Start was too long")
+	// t.Head ([]cid.Cid) (slice)
+	if len(t.Head) > cbg.MaxLength {
+		return xerrors.Errorf("Slice value in field t.Head was too long")
 	}
 
-	if err := cbg.WriteMajorTypeHeaderBuf(scratch, w, cbg.MajArray, uint64(len(t.Start))); err != nil {
+	if err := cbg.WriteMajorTypeHeaderBuf(scratch, w, cbg.MajArray, uint64(len(t.Head))); err != nil {
 		return err
 	}
-	for _, v := range t.Start {
+	for _, v := range t.Head {
 		if err := cbg.WriteCidBuf(scratch, w, v); err != nil {
-			return xerrors.Errorf("failed writing cid field t.Start: %w", err)
+			return xerrors.Errorf("failed writing cid field t.Head: %w", err)
 		}
 	}
 
-	// t.RequestLength (uint64) (uint64)
+	// t.Length (uint64) (uint64)
 
-	if err := cbg.WriteMajorTypeHeaderBuf(scratch, w, cbg.MajUnsignedInt, uint64(t.RequestLength)); err != nil {
+	if err := cbg.WriteMajorTypeHeaderBuf(scratch, w, cbg.MajUnsignedInt, uint64(t.Length)); err != nil {
 		return err
 	}
 
@@ -56,8 +56,8 @@ func (t *BlockSyncRequest) MarshalCBOR(w io.Writer) error {
 	return nil
 }
 
-func (t *BlockSyncRequest) UnmarshalCBOR(r io.Reader) error {
-	*t = BlockSyncRequest{}
+func (t *Request) UnmarshalCBOR(r io.Reader) error {
+	*t = Request{}
 
 	br := cbg.GetPeeker(r)
 	scratch := make([]byte, 8)
@@ -74,7 +74,7 @@ func (t *BlockSyncRequest) UnmarshalCBOR(r io.Reader) error {
 		return fmt.Errorf("cbor input had wrong number of fields")
 	}
 
-	// t.Start ([]cid.Cid) (slice)
+	// t.Head ([]cid.Cid) (slice)
 
 	maj, extra, err = cbg.CborReadHeaderBuf(br, scratch)
 	if err != nil {
@@ -82,7 +82,7 @@ func (t *BlockSyncRequest) UnmarshalCBOR(r io.Reader) error {
 	}
 
 	if extra > cbg.MaxLength {
-		return fmt.Errorf("t.Start: array too large (%d)", extra)
+		return fmt.Errorf("t.Head: array too large (%d)", extra)
 	}
 
 	if maj != cbg.MajArray {
@@ -90,19 +90,19 @@ func (t *BlockSyncRequest) UnmarshalCBOR(r io.Reader) error {
 	}
 
 	if extra > 0 {
-		t.Start = make([]cid.Cid, extra)
+		t.Head = make([]cid.Cid, extra)
 	}
 
 	for i := 0; i < int(extra); i++ {
 
 		c, err := cbg.ReadCid(br)
 		if err != nil {
-			return xerrors.Errorf("reading cid field t.Start failed: %w", err)
+			return xerrors.Errorf("reading cid field t.Head failed: %w", err)
 		}
-		t.Start[i] = c
+		t.Head[i] = c
 	}
 
-	// t.RequestLength (uint64) (uint64)
+	// t.Length (uint64) (uint64)
 
 	{
 
@@ -113,7 +113,7 @@ func (t *BlockSyncRequest) UnmarshalCBOR(r io.Reader) error {
 		if maj != cbg.MajUnsignedInt {
 			return fmt.Errorf("wrong type for uint64 field")
 		}
-		t.RequestLength = uint64(extra)
+		t.Length = uint64(extra)
 
 	}
 	// t.Options (uint64) (uint64)
@@ -133,34 +133,20 @@ func (t *BlockSyncRequest) UnmarshalCBOR(r io.Reader) error {
 	return nil
 }
 
-var lengthBufBlockSyncResponse = []byte{131}
+var lengthBufResponse = []byte{131}
 
-func (t *BlockSyncResponse) MarshalCBOR(w io.Writer) error {
+func (t *Response) MarshalCBOR(w io.Writer) error {
 	if t == nil {
 		_, err := w.Write(cbg.CborNull)
 		return err
 	}
-	if _, err := w.Write(lengthBufBlockSyncResponse); err != nil {
+	if _, err := w.Write(lengthBufResponse); err != nil {
 		return err
 	}
 
 	scratch := make([]byte, 9)
 
-	// t.Chain ([]*blocksync.BSTipSet) (slice)
-	if len(t.Chain) > cbg.MaxLength {
-		return xerrors.Errorf("Slice value in field t.Chain was too long")
-	}
-
-	if err := cbg.WriteMajorTypeHeaderBuf(scratch, w, cbg.MajArray, uint64(len(t.Chain))); err != nil {
-		return err
-	}
-	for _, v := range t.Chain {
-		if err := v.MarshalCBOR(w); err != nil {
-			return err
-		}
-	}
-
-	// t.Status (uint64) (uint64)
+	// t.Status (blocksync.status) (uint64)
 
 	if err := cbg.WriteMajorTypeHeaderBuf(scratch, w, cbg.MajUnsignedInt, uint64(t.Status)); err != nil {
 		return err
@@ -177,11 +163,25 @@ func (t *BlockSyncResponse) MarshalCBOR(w io.Writer) error {
 	if _, err := io.WriteString(w, string(t.ErrorMessage)); err != nil {
 		return err
 	}
+
+	// t.Chain ([]*blocksync.BSTipSet) (slice)
+	if len(t.Chain) > cbg.MaxLength {
+		return xerrors.Errorf("Slice value in field t.Chain was too long")
+	}
+
+	if err := cbg.WriteMajorTypeHeaderBuf(scratch, w, cbg.MajArray, uint64(len(t.Chain))); err != nil {
+		return err
+	}
+	for _, v := range t.Chain {
+		if err := v.MarshalCBOR(w); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-func (t *BlockSyncResponse) UnmarshalCBOR(r io.Reader) error {
-	*t = BlockSyncResponse{}
+func (t *Response) UnmarshalCBOR(r io.Reader) error {
+	*t = Response{}
 
 	br := cbg.GetPeeker(r)
 	scratch := make([]byte, 8)
@@ -198,6 +198,30 @@ func (t *BlockSyncResponse) UnmarshalCBOR(r io.Reader) error {
 		return fmt.Errorf("cbor input had wrong number of fields")
 	}
 
+	// t.Status (blocksync.status) (uint64)
+
+	{
+
+		maj, extra, err = cbg.CborReadHeaderBuf(br, scratch)
+		if err != nil {
+			return err
+		}
+		if maj != cbg.MajUnsignedInt {
+			return fmt.Errorf("wrong type for uint64 field")
+		}
+		t.Status = status(extra)
+
+	}
+	// t.ErrorMessage (string) (string)
+
+	{
+		sval, err := cbg.ReadStringBuf(br, scratch)
+		if err != nil {
+			return err
+		}
+
+		t.ErrorMessage = string(sval)
+	}
 	// t.Chain ([]*blocksync.BSTipSet) (slice)
 
 	maj, extra, err = cbg.CborReadHeaderBuf(br, scratch)
@@ -227,30 +251,6 @@ func (t *BlockSyncResponse) UnmarshalCBOR(r io.Reader) error {
 		t.Chain[i] = &v
 	}
 
-	// t.Status (uint64) (uint64)
-
-	{
-
-		maj, extra, err = cbg.CborReadHeaderBuf(br, scratch)
-		if err != nil {
-			return err
-		}
-		if maj != cbg.MajUnsignedInt {
-			return fmt.Errorf("wrong type for uint64 field")
-		}
-		t.Status = uint64(extra)
-
-	}
-	// t.ErrorMessage (string) (string)
-
-	{
-		sval, err := cbg.ReadStringBuf(br, scratch)
-		if err != nil {
-			return err
-		}
-
-		t.ErrorMessage = string(sval)
-	}
 	return nil
 }
 
